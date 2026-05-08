@@ -1,26 +1,56 @@
-# This example requires the 'message_content' privileged intents
-
 import os
 import discord
+import requests  # Thêm thư viện này để gửi dữ liệu sang n8n
 from discord.ext import commands
-
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# THAY LINK PRODUCTION CỦA ÔNG VÀO ĐÂY
+N8N_WEBHOOK_URL = "https://primary-production-5647d.up.railway.app/webhook/discord-ai"
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
+@bot.event
+async def on_message(message):
+    # Không tự trả lời tin nhắn của chính bot
+    if message.author == bot.user:
+        return
+
+    # Gửi tin nhắn sang n8n
+    payload = {
+        "body": {
+            "content": message.content,
+            "author": str(message.author),
+            "channel_id": str(message.channel.id),
+            "channel_name": str(message.channel.name)
+        }
+    }
+
+    try:
+        # Gửi sang n8n và đợi kết quả
+        response = requests.post(N8N_WEBHOOK_URL, json=payload)
+        
+        # Nếu n8n có trả về text (output), thì bot nhắn lại lên Discord
+        # Lưu ý: n8n Node AI Agent thường trả về JSON có trường 'output'
+        if response.status_code == 200:
+            data = response.json()
+            # Tùy vào node cuối của n8n, nhưng thường là lấy data[0]['output'] hoặc data['output']
+            # Ở đây tôi làm an toàn: nếu n8n trả lời, mình lấy nội dung đó
+            if isinstance(data, list) and 'output' in data[0]:
+                await message.channel.send(data[0]['output'])
+            elif isinstance(data, dict) and 'output' in data:
+                await message.channel.send(data['output'])
+    except Exception as e:
+        print(f"Lỗi gửi n8n: {e}")
+
+    await bot.process_commands(message)
+
 @bot.command()
 async def ping(ctx):
     await ctx.send('pong')
-
-@bot.command()
-async def hello(ctx):
-    await ctx.send("Choo choo! 🚅")
-
 
 bot.run(os.environ["DISCORD_TOKEN"])
