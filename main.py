@@ -20,7 +20,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Link Production chuẩn của n8n
-N8N_WEBHOOK_URL = "https://primary-production-5647d.up.railway.app/webhook/discord-ai"
+N8N_WEBHOOK_URL = "https://primary-production-5647d.up.railway.app/webhook/discord-ai/"
 
 @bot.event
 async def on_ready():
