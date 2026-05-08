@@ -64,10 +64,13 @@ async def on_message(message):
 async def ping(ctx):
     await ctx.send('pong')
 
-bot.run(os.environ["DISCORD_TOKEN"])
+# XÓA CÁI DÒNG bot.run(os.environ["DISCORD_TOKEN"]) CŨ Ở ĐÂY ĐI
 
-# Đoạn cuối sửa thành thế này:
+# PHẢI LÀ NHƯ THẾ NÀY:
 if __name__ == "__main__":
     t = Thread(target=run)
-    t.start() # Chạy web server ở luồng riêng
+    t.daemon = True # Thêm dòng này để server Flask tắt cùng bot
+    t.start() 
+    
+    # Chỉ chạy bot.run DUY NHẤT một lần ở cuối cùng này thôi
     bot.run(os.environ["DISCORD_TOKEN"])
