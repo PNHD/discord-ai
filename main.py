@@ -1,7 +1,18 @@
 import os
 import discord
-import requests  # Thêm thư viện này để gửi dữ liệu sang n8n
+import requests
 from discord.ext import commands
+from threading import Thread
+from flask import Flask # Thêm cái này
+
+# Tạo một app Flask nhỏ để Railway không tắt bot
+app = Flask('')
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -54,3 +65,9 @@ async def ping(ctx):
     await ctx.send('pong')
 
 bot.run(os.environ["DISCORD_TOKEN"])
+
+# Đoạn cuối sửa thành thế này:
+if __name__ == "__main__":
+    t = Thread(target=run)
+    t.start() # Chạy web server ở luồng riêng
+    bot.run(os.environ["DISCORD_TOKEN"])
