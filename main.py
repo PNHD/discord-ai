@@ -31,27 +31,28 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Gửi dữ liệu sang n8n
+    # Lấy ảnh từ Discord gửi sang n8n
+    attachments = [{"proxy_url": a.proxy_url} for a in message.attachments]
+
     payload = {
         "body": {
-            "content": message.content,
-            "author": str(message.author),
-            "channel_id": str(message.channel.id),
-            "channel_name": str(message.channel.name)
+            "body": {
+                "content": message.content,
+                "author": str(message.author),
+                "channel_id": str(message.channel.id),
+                "attachments": attachments
+            }
         }
     }
 
     try:
+        # Chỉ gửi dữ liệu đi, n8n sẽ xử lý việc trả lời
         response = requests.post(N8N_WEBHOOK_URL, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # Lấy câu trả lời từ AI và gửi ngược lại Discord
-            if isinstance(data, list) and len(data) > 0 and 'output' in data[0]:
-                await message.channel.send(data[0]['output'])
-            elif isinstance(data, dict) and 'output' in data:
-                await message.channel.send(data['output'])
+        if response.status_code != 200:
+            print(f"❌ n8n phản hồi lỗi: {response.status_code}")
+            
     except Exception as e:
-        print(f"❌ Lỗi n8n: {e}")
+        print(f"❌ Lỗi kết nối n8n: {e}")
 
     await bot.process_commands(message)
 
@@ -61,5 +62,4 @@ if __name__ == "__main__":
     t.daemon = True
     t.start()
     
-    # CHỈ CHẠY DÒNG NÀY MỘT LẦN DUY NHẤT Ở ĐÂY
     bot.run(os.environ["DISCORD_TOKEN"])
