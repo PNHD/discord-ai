@@ -38,7 +38,7 @@ async def on_message(message):
         "body": {
             "body": {
                 "content": message.content,
-                "author": str(message.author),
+                "author": str(message.author.id),
                 "channel_id": str(message.channel.id),
                 "attachments": attachments
             }
