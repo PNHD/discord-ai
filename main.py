@@ -29,7 +29,7 @@ N8N_WEBHOOK_URL = os.environ.get(
 _raw = os.environ.get("ALLOWED_CHANNELS", "")
 ALLOWED_CHANNELS = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
 
-# Dedup: nhớ 200 message ID gần nhất để chặn duplicate send
+# Dedup: nhớ 200 message ID gần nhất để chặn duplicate
 _processed: deque = deque(maxlen=200)
 
 intents = discord.Intents.default()
@@ -50,8 +50,8 @@ def is_relevant(message: discord.Message) -> bool:
         return True
     return False
 
-def build_payload(message: discord.Message) -> dict:
-    """Build payload gửi lên n8n."""
+def build_payload(message: discord.Message, channel_id: str) -> dict:
+    """Build payload gửi lên n8n. channel_id có thể là thread hoặc channel gốc."""
     ref_author_id = ""
     if (
         message.reference
@@ -65,7 +65,9 @@ def build_payload(message: discord.Message) -> dict:
             "body": {
                 "content": message.content,
                 "author": str(message.author.id),
-                "channel_id": str(message.channel.id),
+                # Gửi channel_id của thread (nếu có) để bot reply đúng chỗ
+                "channel_id": channel_id,
+                # Gửi toàn bộ attachments thay vì chỉ [0]
                 "attachments": [
                     {"proxy_url": a.proxy_url, "filename": a.filename}
                     for a in message.attachments
@@ -76,6 +78,32 @@ def build_payload(message: discord.Message) -> dict:
             }
         }
     }
+
+async def get_or_create_thread(message: discord.Message) -> str:
+    """
+    Tạo thread riêng cho cuộc hội thoại với bot.
+    - Nếu đang ở TextChannel → tạo thread trên tin nhắn đó
+    - Nếu đã ở trong thread → dùng luôn channel hiện tại
+    - Trả về channel_id để n8n biết reply vào đâu
+    """
+    if isinstance(message.channel, discord.Thread):
+        # Đã trong thread rồi, dùng luôn
+        return str(message.channel.id)
+
+    if isinstance(message.channel, discord.TextChannel):
+        try:
+            thread = await message.create_thread(
+                name=f"🎓 {message.author.display_name}",
+                auto_archive_duration=60  # tự archive sau 60 phút không hoạt động
+            )
+            return str(thread.id)
+        except discord.Forbidden:
+            # Bot không có quyền tạo thread → reply ở channel gốc
+            print("⚠️ Không có quyền tạo thread, dùng channel gốc")
+        except discord.HTTPException as e:
+            print(f"⚠️ Lỗi tạo thread: {e}")
+
+    return str(message.channel.id)
 
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
@@ -101,7 +129,10 @@ async def on_message(message: discord.Message):
     if not is_relevant(message):
         return
 
-    payload = build_payload(message)
+    # Tạo / lấy thread → lấy channel_id đúng để n8n reply vào đó
+    channel_id = await get_or_create_thread(message)
+
+    payload = build_payload(message, channel_id)
 
     try:
         # Typing indicator trong lúc chờ n8n xử lý
