@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 import discord
+import base64
 from collections import deque
 from discord.ext import commands
 from threading import Thread
@@ -50,8 +51,30 @@ def is_relevant(message: discord.Message) -> bool:
         return True
     return False
 
-def build_payload(message: discord.Message) -> dict:
-    """Build payload gửi lên n8n."""
+async def download_images(attachments: list, session: aiohttp.ClientSession) -> list:
+    """Download tất cả ảnh, trả về list base64. Bỏ qua ảnh lỗi."""
+    results = []
+    for a in attachments:
+        try:
+            async with session.get(
+                a.proxy_url,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    results.append({
+                        "filename": a.filename,
+                        "data": base64.b64encode(data).decode("utf-8"),
+                        "content_type": resp.content_type or "image/png"
+                    })
+                else:
+                    print(f"⚠️ Download ảnh lỗi {resp.status}: {a.filename}")
+        except Exception as e:
+            print(f"⚠️ Bỏ qua ảnh {a.filename}: {e}")
+    return results
+
+async def build_payload(message: discord.Message, session: aiohttp.ClientSession) -> dict:
+    """Build payload gửi lên n8n, kèm ảnh base64 nếu có."""
     ref_author_id = ""
     if (
         message.reference
@@ -60,17 +83,19 @@ def build_payload(message: discord.Message) -> dict:
     ):
         ref_author_id = str(message.reference.resolved.author.id)
 
+    # Download ảnh ngay tại bot — tránh n8n phải gọi Discord CDN
+    images = []
+    if message.attachments:
+        images = await download_images(message.attachments, session)
+
     return {
         "body": {
             "body": {
                 "content": message.content,
                 "author": str(message.author.id),
                 "channel_id": str(message.channel.id),
-                # Gửi toàn bộ attachments để n8n xử lý multi-image
-                "attachments": [
-                    {"proxy_url": a.proxy_url, "filename": a.filename}
-                    for a in message.attachments
-                ],
+                "images": images,           # base64, sẵn sàng cho AI agent
+                "has_images": len(images) > 0,
                 "referenced_message": {
                     "author_id": ref_author_id
                 } if ref_author_id else None
@@ -102,16 +127,15 @@ async def on_message(message: discord.Message):
     if not is_relevant(message):
         return
 
-    payload = build_payload(message)
-
     try:
-        # Typing indicator trong lúc chờ n8n xử lý
         async with message.channel.typing():
             async with aiohttp.ClientSession() as session:
+                # Download ảnh + build payload trong cùng 1 session
+                payload = await build_payload(message, session)
                 async with session.post(
                     N8N_WEBHOOK_URL,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=60)
                 ) as resp:
                     if resp.status != 200:
                         print(f"❌ n8n lỗi {resp.status}: {await resp.text()}")
