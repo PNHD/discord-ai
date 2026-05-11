@@ -161,25 +161,33 @@ async def download_single_attachment(session: aiohttp.ClientSession, att) -> dic
         print(f"⚠️ Download failed ({att.filename}): {e}")
         return None
 
-async def download_attachments_b64(session: aiohttp.ClientSession,
-                                   attachments: list) -> list:
-    """Download images in parallel, filter out failures."""
-    if not attachments:
-        return []
-    
-    print(f"📥 Downloading {len(attachments)} attachments in parallel...")
-    
-    # Parallel downloads
-    results = await asyncio.gather(
-        *[download_single_attachment(session, att) for att in attachments],
-        return_exceptions=False
-    )
-    
-    # Filter out None values (failed downloads)
-    valid_results = [r for r in results if r is not None]
-    print(f"✓ Downloaded {len(valid_results)}/{len(attachments)} attachments")
-    
-    return valid_results
+async def download_attachments_b64(session, attachments):
+    results = []
+    for att in attachments:
+        url = att.proxy_url
+        print(f"DEBUG: Processing attachment URL: {url}")
+        if not url:
+            print(f"DEBUG: Skipping attachment, missing URL: {att}")
+            continue
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                print(f"DEBUG: HTTP Status for {url}: {r.status}")
+                if r.status != 200:
+                    continue
+                raw = await r.read()
+                mime = r.headers.get("Content-Type", "image/png")
+                name = att.filename or "screenshot.png"
+                encoded_data = base64.b64encode(raw).decode("utf-8")
+                results.append({
+                    "data": encoded_data,
+                    "mime": mime,
+                    "name": name,
+                })
+                print(f"DEBUG: Downloaded and encoded {name}")
+        except Exception as e:
+            print(f"⚠️ Download failed ({att.filename}): {e}")
+    print(f"DEBUG: Total attachments downloaded: {len(results)}")
+    return results
 
 async def build_payload(session: aiohttp.ClientSession,
                         message: discord.Message) -> dict:
