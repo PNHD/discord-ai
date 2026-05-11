@@ -1,8 +1,4 @@
-import os
-import asyncio
-import base64
-import aiohttp
-import discord
+import os, asyncio, aiohttp, discord
 from collections import deque
 from discord.ext import commands
 from threading import Thread
@@ -30,8 +26,8 @@ intents.members   = True
 intents.presences = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ── Typing indicator liên tục (mỗi 8s refresh, Discord timeout 10s) ───────────
-async def keep_typing(channel: discord.abc.Messageable, stop: asyncio.Event):
+# ── Typing indicator liên tục (refresh mỗi 8s) ───────────────────────────────
+async def keep_typing(channel, stop: asyncio.Event):
     while not stop.is_set():
         try:
             await channel.trigger_typing()
@@ -40,43 +36,8 @@ async def keep_typing(channel: discord.abc.Messageable, stop: asyncio.Event):
         try:
             await asyncio.wait_for(asyncio.shield(stop.wait()), timeout=8)
         except asyncio.TimeoutError:
-            pass  # chưa stop → tiếp tục loop
+            pass
 
-# ── Download ảnh → base64 (chạy trong bot, không để n8n gọi CDN) ─────────────
-async def fetch_attachments(attachments) -> list:
-    result = []
-    async with aiohttp.ClientSession() as sess:
-        for att in attachments:
-            b64, mime = "", "image/png"
-            try:
-                async with sess.get(att.proxy_url,
-                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
-                    if r.status == 200:
-                        data = await r.read()
-                        b64  = base64.b64encode(data).decode()
-                        mime = r.headers.get("content-type", "image/png")
-                        print(f"✓ Downloaded {att.filename} ({len(data)//1024}KB)")
-                    else:
-                        print(f"⚠️ CDN {r.status} for {att.filename}")
-            except Exception as e:
-                print(f"⚠️ Download failed {att.filename}: {e}")
-            result.append({"filename": att.filename,
-                           "base64": b64, "mime_type": mime})
-    return result
-
-# ── Discord activity (game đang chơi) ────────────────────────────────────────
-def get_activities(message: discord.Message) -> list:
-    member = message.guild.get_member(message.author.id) if message.guild else None
-    if not member:
-        return []
-    return [{
-        "name"   : a.name,
-        "type"   : a.type.name,
-        "details": getattr(a, "details", None),
-        "state"  : getattr(a, "state",   None),
-    } for a in member.activities]
-
-# ── Relevance check ───────────────────────────────────────────────────────────
 def is_relevant(message: discord.Message) -> bool:
     if bot.user in message.mentions:
         return True
@@ -85,33 +46,37 @@ def is_relevant(message: discord.Message) -> bool:
         return ref.resolved.author.id == BOT_ID
     return False
 
-# ── Build payload ─────────────────────────────────────────────────────────────
-async def build_payload(message: discord.Message) -> dict:
+def get_activities(message: discord.Message) -> list:
+    member = message.guild.get_member(message.author.id) if message.guild else None
+    if not member:
+        return []
+    return [{"name": a.name, "type": a.type.name,
+             "details": getattr(a,"details",None),
+             "state":   getattr(a,"state",None)}
+            for a in member.activities]
+
+def build_payload(message: discord.Message) -> dict:
     ref_author_id = ""
     ref = message.reference
     if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
         ref_author_id = str(ref.resolved.author.id)
 
-    attachments_b64 = []
-    if message.attachments:
-        attachments_b64 = await fetch_attachments(message.attachments)
-
     return {
         "body": {
             "body": {
-                "content"         : message.content,
-                "author"          : str(message.author.id),
-                "channel_id"      : str(message.channel.id),
-                "attachments"     : [{"proxy_url": a.proxy_url, "filename": a.filename}
-                                     for a in message.attachments],
-                "attachments_b64" : attachments_b64,
+                "content"          : message.content,
+                "author"           : str(message.author.id),
+                "channel_id"       : str(message.channel.id),
+                # Gửi URL ngay — n8n tự download (nhanh hơn download trong bot)
+                "attachments"      : [{"proxy_url": a.proxy_url,
+                                       "filename":  a.filename}
+                                      for a in message.attachments],
                 "discord_activities": get_activities(message),
                 "referenced_message": {"author_id": ref_author_id} if ref_author_id else None,
             }
         }
     }
 
-# ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} (ID: {bot.user.id})")
@@ -132,9 +97,9 @@ async def on_message(message: discord.Message):
     typing_task = asyncio.create_task(keep_typing(message.channel, stop_typing))
 
     try:
-        payload = await build_payload(message)
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(N8N_URL, json=payload,
+            async with sess.post(N8N_URL,
+                                 json=build_payload(message),
                                  timeout=aiohttp.ClientTimeout(total=120)) as r:
                 if r.status != 200:
                     print(f"❌ n8n {r.status}: {await r.text()}")
