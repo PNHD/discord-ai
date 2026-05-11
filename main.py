@@ -17,54 +17,66 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
-BOT_ID      = int(os.environ.get("BOT_ID", "1502278190788382770"))
-N8N_URL     = os.environ.get("N8N_WEBHOOK_URL",
-              "https://primary-production-5647d.up.railway.app/webhook/discord-ai")
-_raw        = os.environ.get("ALLOWED_CHANNELS", "")
-ALLOWED_CH  = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
-_processed  = deque(maxlen=200)
+BOT_ID     = int(os.environ.get("BOT_ID", "1502278190788382770"))
+N8N_URL    = os.environ.get("N8N_WEBHOOK_URL",
+             "https://primary-production-5647d.up.railway.app/webhook/discord-ai")
+_raw       = os.environ.get("ALLOWED_CHANNELS", "")
+ALLOWED_CH = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
+_processed = deque(maxlen=200)
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members   = True   # cần để đọc activity
-intents.presences = True   # cần để đọc game đang chơi
+intents.members   = True
+intents.presences = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ── Download all attachments → base64 (chạy trong bot, tránh n8n gọi CDN) ────
-async def fetch_attachments(attachments: list) -> list:
+# ── Typing indicator liên tục (mỗi 8s refresh, Discord timeout 10s) ───────────
+async def keep_typing(channel: discord.abc.Messageable, stop: asyncio.Event):
+    while not stop.is_set():
+        try:
+            await channel.trigger_typing()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(stop.wait()), timeout=8)
+        except asyncio.TimeoutError:
+            pass  # chưa stop → tiếp tục loop
+
+# ── Download ảnh → base64 (chạy trong bot, không để n8n gọi CDN) ─────────────
+async def fetch_attachments(attachments) -> list:
     result = []
     async with aiohttp.ClientSession() as sess:
         for att in attachments:
             b64, mime = "", "image/png"
             try:
                 async with sess.get(att.proxy_url,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
                     if r.status == 200:
-                        b64  = base64.b64encode(await r.read()).decode()
+                        data = await r.read()
+                        b64  = base64.b64encode(data).decode()
                         mime = r.headers.get("content-type", "image/png")
+                        print(f"✓ Downloaded {att.filename} ({len(data)//1024}KB)")
                     else:
                         print(f"⚠️ CDN {r.status} for {att.filename}")
             except Exception as e:
                 print(f"⚠️ Download failed {att.filename}: {e}")
-            result.append({"filename": att.filename, "base64": b64, "mime_type": mime})
+            result.append({"filename": att.filename,
+                           "base64": b64, "mime_type": mime})
     return result
 
-# ── Lấy Discord activity (game đang chơi, v.v.) ───────────────────────────────
+# ── Discord activity (game đang chơi) ────────────────────────────────────────
 def get_activities(message: discord.Message) -> list:
     member = message.guild.get_member(message.author.id) if message.guild else None
     if not member:
         return []
-    acts = []
-    for a in member.activities:
-        acts.append({
-            "name"   : a.name,
-            "type"   : a.type.name,                          # playing/streaming/listening
-            "details": getattr(a, "details", None),
-            "state"  : getattr(a, "state",   None),
-        })
-    return acts
+    return [{
+        "name"   : a.name,
+        "type"   : a.type.name,
+        "details": getattr(a, "details", None),
+        "state"  : getattr(a, "state",   None),
+    } for a in member.activities]
 
-# ── Filter ────────────────────────────────────────────────────────────────────
+# ── Relevance check ───────────────────────────────────────────────────────────
 def is_relevant(message: discord.Message) -> bool:
     if bot.user in message.mentions:
         return True
@@ -80,7 +92,6 @@ async def build_payload(message: discord.Message) -> dict:
     if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
         ref_author_id = str(ref.resolved.author.id)
 
-    # Download ảnh ngay tại đây
     attachments_b64 = []
     if message.attachments:
         attachments_b64 = await fetch_attachments(message.attachments)
@@ -88,15 +99,12 @@ async def build_payload(message: discord.Message) -> dict:
     return {
         "body": {
             "body": {
-                "content"    : message.content,
-                "author"     : str(message.author.id),
-                "channel_id" : str(message.channel.id),
-                # proxy_url vẫn giữ để backward compat
-                "attachments": [{"proxy_url": a.proxy_url, "filename": a.filename}
-                                for a in message.attachments],
-                # base64 để n8n không cần tự download
-                "attachments_b64": attachments_b64,
-                # activity Discord hiện tại
+                "content"         : message.content,
+                "author"          : str(message.author.id),
+                "channel_id"      : str(message.channel.id),
+                "attachments"     : [{"proxy_url": a.proxy_url, "filename": a.filename}
+                                     for a in message.attachments],
+                "attachments_b64" : attachments_b64,
                 "discord_activities": get_activities(message),
                 "referenced_message": {"author_id": ref_author_id} if ref_author_id else None,
             }
@@ -120,19 +128,23 @@ async def on_message(message: discord.Message):
     if not is_relevant(message):
         return
 
-    payload = await build_payload(message)
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(message.channel, stop_typing))
 
     try:
-        async with message.channel.typing():
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(N8N_URL, json=payload,
-                                     timeout=aiohttp.ClientTimeout(total=60)) as r:
-                    if r.status != 200:
-                        print(f"❌ n8n {r.status}: {await r.text()}")
+        payload = await build_payload(message)
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(N8N_URL, json=payload,
+                                 timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    print(f"❌ n8n {r.status}: {await r.text()}")
     except asyncio.TimeoutError:
-        print("⚠️ n8n timeout")
+        print("⚠️ n8n timeout >120s")
     except aiohttp.ClientError as e:
         print(f"❌ n8n error: {e}")
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
 
     await bot.process_commands(message)
 
