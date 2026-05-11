@@ -1,13 +1,9 @@
-import os
-import asyncio
-import aiohttp
-import discord
+import os, asyncio, aiohttp, discord
 from collections import deque
 from discord.ext import commands
 from threading import Thread
 from flask import Flask
 
-# ── Web server mini để Railway giữ process alive ──────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
@@ -17,111 +13,92 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
-# ── Cấu hình Bot ─────────────────────────────────────────────────────────────
-BOT_ID = int(os.environ.get("BOT_ID", "1502278190788382770"))
-N8N_WEBHOOK_URL = os.environ.get(
-    "N8N_WEBHOOK_URL",
-    "https://primary-production-5647d.up.railway.app/webhook/discord-ai"
-)
-
-# Channel whitelist — để trống = cho phép tất cả channel
-# Để giới hạn: thêm env var ALLOWED_CHANNELS=123456789,987654321
-_raw = os.environ.get("ALLOWED_CHANNELS", "")
-ALLOWED_CHANNELS = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
-
-# Dedup: nhớ 200 message ID gần nhất để chặn duplicate
-_processed: deque = deque(maxlen=200)
+BOT_ID      = int(os.environ.get("BOT_ID", "1502278190788382770"))
+N8N_URL     = os.environ.get("N8N_WEBHOOK_URL",
+              "https://primary-production-5647d.up.railway.app/webhook/discord-ai")
+_raw        = os.environ.get("ALLOWED_CHANNELS", "")
+ALLOWED_CH  = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
+_processed  = deque(maxlen=200)
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Typing indicator liên tục (refresh mỗi 8s, Discord timeout 10s) ──────────
+async def keep_typing(channel, stop: asyncio.Event):
+    while not stop.is_set():
+        try:
+            await channel.trigger_typing()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(stop.wait()), timeout=8)
+        except asyncio.TimeoutError:
+            pass
+
 def is_relevant(message: discord.Message) -> bool:
-    """Chỉ xử lý khi bot được mention hoặc reply vào tin của bot."""
     if bot.user in message.mentions:
         return True
-    if (
-        message.reference
-        and message.reference.resolved
-        and isinstance(message.reference.resolved, discord.Message)
-        and message.reference.resolved.author.id == BOT_ID
-    ):
-        return True
+    ref = message.reference
+    if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
+        return ref.resolved.author.id == BOT_ID
     return False
 
 def build_payload(message: discord.Message) -> dict:
-    """Build payload gửi lên n8n."""
     ref_author_id = ""
-    if (
-        message.reference
-        and message.reference.resolved
-        and isinstance(message.reference.resolved, discord.Message)
-    ):
-        ref_author_id = str(message.reference.resolved.author.id)
+    ref = message.reference
+    if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
+        ref_author_id = str(ref.resolved.author.id)
 
     return {
         "body": {
             "body": {
-                "content": message.content,
-                "author": str(message.author.id),
-                "channel_id": str(message.channel.id),
-                "attachments": [
-                    {"proxy_url": a.proxy_url, "filename": a.filename}
-                    for a in message.attachments
-                ],
-                "referenced_message": {
-                    "author_id": ref_author_id
-                } if ref_author_id else None
+                "content"          : message.content,
+                "author"           : str(message.author.id),
+                "channel_id"       : str(message.channel.id),
+                "attachments"      : [{"proxy_url": a.proxy_url, "filename": a.filename}
+                                      for a in message.attachments],
+                "referenced_message": {"author_id": ref_author_id} if ref_author_id else None,
             }
         }
     }
 
-# ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"✅ Đã đăng nhập: {bot.user} (ID: {bot.user.id})")
+    print(f"✅ {bot.user} (ID: {bot.user.id})")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Bỏ qua tin của bot
     if message.author.bot:
         return
-
-    # Channel whitelist
-    if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
+    if ALLOWED_CH and message.channel.id not in ALLOWED_CH:
         return
-
-    # Chặn duplicate
     if message.id in _processed:
         return
     _processed.append(message.id)
-
-    # Chỉ forward nếu mention hoặc reply bot
     if not is_relevant(message):
         return
 
-    payload = build_payload(message)
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(message.channel, stop_typing))
 
     try:
-        async with message.channel.typing():
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    N8N_WEBHOOK_URL,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status != 200:
-                        print(f"❌ n8n lỗi {resp.status}: {await resp.text()}")
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(N8N_URL,
+                                 json=build_payload(message),
+                                 timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    print(f"❌ n8n {r.status}: {await r.text()}")
     except asyncio.TimeoutError:
-        print("⚠️ n8n timeout (>30s)")
+        print("⚠️ n8n timeout >120s")
     except aiohttp.ClientError as e:
-        print(f"❌ Lỗi kết nối n8n: {e}")
+        print(f"❌ n8n error: {e}")
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
 
     await bot.process_commands(message)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    Thread(target=run_flask, daemon=True).start()
     bot.run(os.environ["DISCORD_TOKEN"])
