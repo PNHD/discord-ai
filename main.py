@@ -1,4 +1,4 @@
-import os, asyncio, aiohttp, discord
+import os, asyncio, aiohttp, discord, base64
 from collections import deque
 from discord.ext import commands
 from threading import Thread
@@ -26,7 +26,7 @@ intents.members   = True
 intents.presences = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ── Typing indicator liên tục (refresh mỗi 8s) ───────────────────────────────
+# ── Typing indicator liên tục (refresh mỗi 8s) ──────────────────────────────
 async def keep_typing(channel, stop: asyncio.Event):
     while not stop.is_set():
         try:
@@ -51,26 +51,61 @@ def get_activities(message: discord.Message) -> list:
     if not member:
         return []
     return [{"name": a.name, "type": a.type.name,
-             "details": getattr(a,"details",None),
-             "state":   getattr(a,"state",None)}
+             "details": getattr(a, "details", None),
+             "state":   getattr(a, "state",   None)}
             for a in member.activities]
 
-def build_payload(message: discord.Message) -> dict:
+async def download_attachments_b64(session: aiohttp.ClientSession,
+                                   attachments: list) -> list:
+    """Download each attachment and return list of {data, mime, name}."""
+    results = []
+    for att in attachments:
+        url = att.proxy_url
+        if not url:
+            continue
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status != 200:
+                    print(f"⚠️ Attachment {r.status}: {url[:60]}")
+                    continue
+                raw  = await r.read()
+                mime = r.headers.get("Content-Type", "image/png")
+                name = att.filename or "screenshot.png"
+                results.append({
+                    "data": base64.b64encode(raw).decode("utf-8"),
+                    "mime": mime,
+                    "name": name,
+                })
+                print(f"✓ Downloaded {name}: {len(raw)} bytes")
+        except Exception as e:
+            print(f"⚠️ Download failed ({att.filename}): {e}")
+    return results
+
+async def build_payload(session: aiohttp.ClientSession,
+                        message: discord.Message) -> dict:
     ref_author_id = ""
     ref = message.reference
     if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
         ref_author_id = str(ref.resolved.author.id)
 
+    # Download images in the bot — avoid n8n making external HTTP calls
+    attachments_b64 = await download_attachments_b64(session, message.attachments)
+
     return {
         "body": {
             "body": {
-                "content"          : message.content,
-                "author"           : str(message.author.id),
-                "channel_id"       : str(message.channel.id),
-                # Gửi URL ngay — n8n tự download (nhanh hơn download trong bot)
-                "attachments"      : [{"proxy_url": a.proxy_url,
-                                       "filename":  a.filename}
-                                      for a in message.attachments],
+                "content"           : message.content,
+                "author"            : str(message.author.id),
+                "channel_id"        : str(message.channel.id),
+                # Keep URL list for reference / If-node check
+                "attachments"       : [{"proxy_url": a.proxy_url,
+                                        "filename":  a.filename}
+                                       for a in message.attachments],
+                # Base64-encoded images — n8n decodes these directly
+                "attachments_b64"   : attachments_b64,
                 "discord_activities": get_activities(message),
                 "referenced_message": {"author_id": ref_author_id} if ref_author_id else None,
             }
@@ -98,9 +133,12 @@ async def on_message(message: discord.Message):
 
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(N8N_URL,
-                                 json=build_payload(message),
-                                 timeout=aiohttp.ClientTimeout(total=120)) as r:
+            payload = await build_payload(sess, message)
+            async with sess.post(
+                N8N_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as r:
                 if r.status != 200:
                     print(f"❌ n8n {r.status}: {await r.text()}")
     except asyncio.TimeoutError:
