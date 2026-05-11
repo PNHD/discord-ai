@@ -1,5 +1,6 @@
 import os
 import asyncio
+import base64
 import aiohttp
 import discord
 from collections import deque
@@ -7,7 +8,6 @@ from discord.ext import commands
 from threading import Thread
 from flask import Flask
 
-# ── Web server mini để Railway giữ process alive ──────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
@@ -17,62 +17,88 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
-# ── Cấu hình Bot ─────────────────────────────────────────────────────────────
-BOT_ID = int(os.environ.get("BOT_ID", "1502278190788382770"))
-N8N_WEBHOOK_URL = os.environ.get(
-    "N8N_WEBHOOK_URL",
-    "https://primary-production-5647d.up.railway.app/webhook/discord-ai"
-)
-
-# Channel whitelist — để trống = cho phép tất cả channel
-# Để giới hạn: thêm env var ALLOWED_CHANNELS=123456789,987654321
-_raw = os.environ.get("ALLOWED_CHANNELS", "")
-ALLOWED_CHANNELS = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
-
-# Dedup: nhớ 200 message ID gần nhất để chặn duplicate
-_processed: deque = deque(maxlen=200)
+BOT_ID      = int(os.environ.get("BOT_ID", "1502278190788382770"))
+N8N_URL     = os.environ.get("N8N_WEBHOOK_URL",
+              "https://primary-production-5647d.up.railway.app/webhook/discord-ai")
+_raw        = os.environ.get("ALLOWED_CHANNELS", "")
+ALLOWED_CH  = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
+_processed  = deque(maxlen=200)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members   = True   # cần để đọc activity
+intents.presences = True   # cần để đọc game đang chơi
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Download all attachments → base64 (chạy trong bot, tránh n8n gọi CDN) ────
+async def fetch_attachments(attachments: list) -> list:
+    result = []
+    async with aiohttp.ClientSession() as sess:
+        for att in attachments:
+            b64, mime = "", "image/png"
+            try:
+                async with sess.get(att.proxy_url,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        b64  = base64.b64encode(await r.read()).decode()
+                        mime = r.headers.get("content-type", "image/png")
+                    else:
+                        print(f"⚠️ CDN {r.status} for {att.filename}")
+            except Exception as e:
+                print(f"⚠️ Download failed {att.filename}: {e}")
+            result.append({"filename": att.filename, "base64": b64, "mime_type": mime})
+    return result
+
+# ── Lấy Discord activity (game đang chơi, v.v.) ───────────────────────────────
+def get_activities(message: discord.Message) -> list:
+    member = message.guild.get_member(message.author.id) if message.guild else None
+    if not member:
+        return []
+    acts = []
+    for a in member.activities:
+        acts.append({
+            "name"   : a.name,
+            "type"   : a.type.name,                          # playing/streaming/listening
+            "details": getattr(a, "details", None),
+            "state"  : getattr(a, "state",   None),
+        })
+    return acts
+
+# ── Filter ────────────────────────────────────────────────────────────────────
 def is_relevant(message: discord.Message) -> bool:
-    """Chỉ xử lý khi bot được mention hoặc reply vào tin của bot."""
     if bot.user in message.mentions:
         return True
-    if (
-        message.reference
-        and message.reference.resolved
-        and isinstance(message.reference.resolved, discord.Message)
-        and message.reference.resolved.author.id == BOT_ID
-    ):
-        return True
+    ref = message.reference
+    if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
+        return ref.resolved.author.id == BOT_ID
     return False
 
-def build_payload(message: discord.Message) -> dict:
-    """Build payload gửi lên n8n."""
+# ── Build payload ─────────────────────────────────────────────────────────────
+async def build_payload(message: discord.Message) -> dict:
     ref_author_id = ""
-    if (
-        message.reference
-        and message.reference.resolved
-        and isinstance(message.reference.resolved, discord.Message)
-    ):
-        ref_author_id = str(message.reference.resolved.author.id)
+    ref = message.reference
+    if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
+        ref_author_id = str(ref.resolved.author.id)
+
+    # Download ảnh ngay tại đây
+    attachments_b64 = []
+    if message.attachments:
+        attachments_b64 = await fetch_attachments(message.attachments)
 
     return {
         "body": {
             "body": {
-                "content": message.content,
-                "author": str(message.author.id),
-                "channel_id": str(message.channel.id),
-                "attachments": [
-                    {"proxy_url": a.proxy_url, "filename": a.filename}
-                    for a in message.attachments
-                ],
-                "referenced_message": {
-                    "author_id": ref_author_id
-                } if ref_author_id else None
+                "content"    : message.content,
+                "author"     : str(message.author.id),
+                "channel_id" : str(message.channel.id),
+                # proxy_url vẫn giữ để backward compat
+                "attachments": [{"proxy_url": a.proxy_url, "filename": a.filename}
+                                for a in message.attachments],
+                # base64 để n8n không cần tự download
+                "attachments_b64": attachments_b64,
+                # activity Discord hiện tại
+                "discord_activities": get_activities(message),
+                "referenced_message": {"author_id": ref_author_id} if ref_author_id else None,
             }
         }
     }
@@ -80,48 +106,36 @@ def build_payload(message: discord.Message) -> dict:
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"✅ Đã đăng nhập: {bot.user} (ID: {bot.user.id})")
+    print(f"✅ {bot.user} (ID: {bot.user.id})")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Bỏ qua tin của bot
     if message.author.bot:
         return
-
-    # Channel whitelist
-    if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
+    if ALLOWED_CH and message.channel.id not in ALLOWED_CH:
         return
-
-    # Chặn duplicate
     if message.id in _processed:
         return
     _processed.append(message.id)
-
-    # Chỉ forward nếu mention hoặc reply bot
     if not is_relevant(message):
         return
 
-    payload = build_payload(message)
+    payload = await build_payload(message)
 
     try:
         async with message.channel.typing():
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    N8N_WEBHOOK_URL,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status != 200:
-                        print(f"❌ n8n lỗi {resp.status}: {await resp.text()}")
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(N8N_URL, json=payload,
+                                     timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status != 200:
+                        print(f"❌ n8n {r.status}: {await r.text()}")
     except asyncio.TimeoutError:
-        print("⚠️ n8n timeout (>30s)")
+        print("⚠️ n8n timeout")
     except aiohttp.ClientError as e:
-        print(f"❌ Lỗi kết nối n8n: {e}")
+        print(f"❌ n8n error: {e}")
 
     await bot.process_commands(message)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    Thread(target=run_flask, daemon=True).start()
     bot.run(os.environ["DISCORD_TOKEN"])
