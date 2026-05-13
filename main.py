@@ -20,7 +20,9 @@ N8N_URL    = os.environ.get(
 )
 _raw       = os.environ.get("ALLOWED_CHANNELS", "")
 ALLOWED_CH = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 _processed = deque(maxlen=300)
+_last_forwarded = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -45,6 +47,30 @@ def is_relevant(message: discord.Message) -> bool:
     ref = message.reference
     if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
         return ref.resolved.author.id == BOT_ID
+    return False
+
+def should_skip_cooldown(message: discord.Message) -> bool:
+    """Prevent rapid-fire duplicate n8n executions per user/channel.
+
+    Kids often send 2-3 messages in a row while waiting. Without this guard,
+    each relevant mention/reply can trigger a separate n8n execution and the
+    workflow may generate multiple exercises. The cooldown is intentionally
+    applied only after `is_relevant()` passes, so unrelated Discord chatter is
+    never affected.
+    """
+    if COOLDOWN_SECONDS <= 0:
+        return False
+
+    now = asyncio.get_running_loop().time()
+    key = f"{message.author.id}:{message.channel.id}"
+    last = _last_forwarded.get(key, 0)
+
+    if now - last < COOLDOWN_SECONDS:
+        remaining = round(COOLDOWN_SECONDS - (now - last), 1)
+        print(f"⏳ Cooldown skip {key}; {remaining}s remaining")
+        return True
+
+    _last_forwarded[key] = now
     return False
 
 def get_activities(message: discord.Message) -> list:
@@ -136,6 +162,7 @@ async def build_payload(session: aiohttp.ClientSession, message: discord.Message
 async def on_ready():
     print(f"✅ {bot.user} (ID: {bot.user.id})")
     print(f"➡️ n8n webhook: {N8N_URL}")
+    print(f"⏳ Cooldown: {COOLDOWN_SECONDS}s per user/channel")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -147,6 +174,8 @@ async def on_message(message: discord.Message):
         return
     _processed.append(message.id)
     if not is_relevant(message):
+        return
+    if should_skip_cooldown(message):
         return
 
     stop_typing = asyncio.Event()
