@@ -25,6 +25,20 @@ N8N_URL    = os.environ.get("N8N_WEBHOOK_URL",
              "https://primary-production-5647d.up.railway.app/webhook/discord-ai")
 _raw       = os.environ.get("ALLOWED_CHANNELS", "")
 ALLOWED_CH = set(int(c) for c in _raw.split(",") if c.strip()) if _raw else set()
+
+# Channels where the bot should auto-forward messages to n8n
+# even when the user does NOT mention/reply to the bot.
+# Leave AUTO_CHANNELS empty to rely on AUTO_CHANNEL_NAMES.
+_auto_raw  = os.environ.get("AUTO_CHANNELS", "")
+AUTO_CH    = set(int(c) for c in _auto_raw.split(",") if c.strip()) if _auto_raw else set()
+
+_auto_names_raw = os.environ.get("AUTO_CHANNEL_NAMES", "test,chat-chung,dứa,di,whis")
+AUTO_CH_NAMES = {
+    c.strip().lower()
+    for c in _auto_names_raw.split(",")
+    if c.strip()
+}
+
 _processed = deque(maxlen=200)
 
 intents = discord.Intents.default()
@@ -48,11 +62,28 @@ async def keep_typing(channel, stop: asyncio.Event):
 
 
 def is_relevant(message: discord.Message) -> bool:
+    """
+    Forward to n8n when:
+    1) the message is in an auto channel such as #dứa/#di/#whis/#chat-chung/#test;
+    2) OR the bot is mentioned;
+    3) OR the user replies to a bot message.
+    """
+    channel_name = getattr(message.channel, "name", "") or ""
+    channel_name_norm = channel_name.lower()
+
+    if message.channel.id in AUTO_CH:
+        return True
+
+    if channel_name_norm in AUTO_CH_NAMES:
+        return True
+
     if bot.user in message.mentions:
         return True
+
     ref = message.reference
     if ref and ref.resolved and isinstance(ref.resolved, discord.Message):
         return ref.resolved.author.id == BOT_ID
+
     return False
 
 
@@ -154,21 +185,34 @@ async def build_payload(session: aiohttp.ClientSession,
 async def on_ready():
     print(f"✅ {bot.user} (ID: {bot.user.id})")
     print(f"   Pillow available: {HAS_PIL}")
+    print(f"   ALLOWED_CHANNELS: {sorted(ALLOWED_CH) if ALLOWED_CH else 'ALL'}")
+    print(f"   AUTO_CHANNELS: {sorted(AUTO_CH) if AUTO_CH else 'by channel name'}")
+    print(f"   AUTO_CHANNEL_NAMES: {sorted(AUTO_CH_NAMES)}")
 
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    print(f"👀 Seen [{message.channel}] id={message.channel.id} "
+          f"author={message.author} content={message.content[:80]!r} "
+          f"attachments={len(message.attachments)}")
+
     if ALLOWED_CH and message.channel.id not in ALLOWED_CH:
-        return
-    if message.id in _processed:
-        return
-    _processed.append(message.id)
-    if not is_relevant(message):
+        print(f"⏭️  Skip channel not in ALLOWED_CHANNELS: {message.channel} ({message.channel.id})")
         return
 
-    print(f"📨 [{message.channel}] {message.author}: {message.content[:80]}"
+    if message.id in _processed:
+        print(f"⏭️  Skip duplicate message: {message.id}")
+        return
+    _processed.append(message.id)
+
+    if not is_relevant(message):
+        print(f"⏭️  Skip not relevant: no auto-channel/mention/reply")
+        return
+
+    print(f"📨 Forward [{message.channel}] {message.author}: {message.content[:80]}"
           f" | attachments={len(message.attachments)}")
 
     stop_typing = asyncio.Event()
