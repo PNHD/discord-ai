@@ -89,7 +89,7 @@ async def download_attachments_b64(session, attachments):
                     print(f'download failed {resp.status}: {filename}', flush=True)
                     continue
                 raw = await resp.read()
-                data, mime = await asyncio.get_event_loop().run_in_executor(None, compress_image, raw)
+                data, mime = await asyncio.get_running_loop().run_in_executor(None, compress_image, raw)
                 name = filename.rsplit('.', 1)[0] + '.jpg' if mime == 'image/jpeg' else filename
                 out.append({'data': base64.b64encode(data).decode('utf-8'), 'mime': mime, 'name': name})
                 print(f'downloaded attachment: {filename} -> {name}', flush=True)
