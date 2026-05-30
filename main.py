@@ -1,4 +1,5 @@
 import os, asyncio, aiohttp, discord, base64, json, io
+
 from collections import deque
 from discord.ext import commands
 from threading import Thread
@@ -122,7 +123,9 @@ async def build_payload(session, message):
             'content': ref_msg.content or '',
             'attachments': [{'proxy_url': a.proxy_url, 'url': a.url, 'filename': a.filename} for a in ref_msg.attachments],
         }
+
     direct_b64 = await download_attachments_b64(session, message.attachments)
+
     return {'body': {'body': {
         'content': message.content or '',
         'author': str(message.author.id),
@@ -149,14 +152,18 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
+
     print(f"Seen channel={getattr(message.channel, 'name', '')} id={message.channel.id} author={message.author} content={repr((message.content or '')[:100])} attachments={len(message.attachments)}", flush=True)
+
     if message.id in PROCESSED:
         print(f'skip duplicate message {message.id}', flush=True)
         return
     PROCESSED.append(message.id)
+
     if not should_forward(message):
         print('skip: no bot mention and not a reply to bot', flush=True)
         return
+
     stop = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(message.channel, stop))
     try:
@@ -178,6 +185,7 @@ async def on_message(message):
     finally:
         stop.set()
         typing_task.cancel()
+
     await bot.process_commands(message)
 
 if __name__ == '__main__':
