@@ -145,11 +145,12 @@ async def fetch_one_image(
 
     print(f"FETCH_OK {label} {len(data)} bytes mime={mime}", flush=True)
     return {
-        "data_url": data_url,
-        "mime":     mime,
-        "name":     name,
-        "url":      url,
-    }
+    "data": b64,
+    "data_url": data_url,
+    "mime": mime,
+    "name": name,
+    "url": url,
+}
 
 
 async def fetch_images(
